@@ -145,16 +145,10 @@ def create_app(config: GatewayConfig | str) -> FastAPI:
         response.headers["X-Frame-Options"] = "DENY"
         response.headers.setdefault(
             "Content-Security-Policy",
-            # style-src allows 'unsafe-inline' because the built Svelte
-            # components use a handful of static inline style="..." attributes
-            # (see ui/src/pages/*.svelte); img-src allows data: for the
-            # inline-SVG favicon (ui/index.html) -- no external image host
-            # is ever loaded; script-src stays locked to 'self' so injected
-            # <script> content still cannot execute.
             "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'self' https: http:",
         )
-        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["X-Content-Type-Options"] = "nosniff"
 
         # The JSON API carries session state, pending-authorization details
