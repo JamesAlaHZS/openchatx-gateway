@@ -65,6 +65,9 @@ class UserConfig(BaseModel):
     """A local user allowed to log in to the gateway's authorization server."""
 
     username: str
+    # Exactly one of these must be set. `password_hash` is a bcrypt hash
+    # (generate with `mcp-gateway hash-password`); `password` is plaintext and
+    # only meant for quick local testing.
     password_hash: str | None = None
     password: str | None = None
 
@@ -89,9 +92,11 @@ class StaticOAuthClientConfig(BaseModel):
 
 
 class ServerConfig(BaseModel):
+    # Public HTTPS URL clients use to reach the gateway (behind the reverse proxy).
     public_url: str
     host: str = "0.0.0.0"
     port: int = 8000
+    # Peers uvicorn trusts to set X-Forwarded-For / X-Forwarded-Proto.
     trusted_proxy_ips: str = "127.0.0.1"
 
     @field_validator("public_url")
@@ -102,6 +107,8 @@ class ServerConfig(BaseModel):
 
 class AuthConfig(BaseModel):
     users: list[UserConfig]
+    # Fernet key (or arbitrary passphrase, which is stretched via scrypt) used to
+    # encrypt secrets at rest in the SQLite database.
     encryption_key: str
 
     @field_validator("encryption_key")
@@ -114,15 +121,21 @@ class AuthConfig(BaseModel):
             )
         return v
 
+    # Secret for signing browser session cookies; derived from encryption_key when unset.
     session_secret: str | None = None
     access_token_expiry_seconds: int = 3600
     refresh_token_expiry_seconds: int = 60 * 60 * 24 * 30
     authorization_code_expiry_seconds: int = 300
     login_session_expiry_seconds: int = 60 * 60 * 8
+    # Allow-list of redirect URI patterns for dynamically registered / CIMD clients.
+    # Defaults include Claude, Gemini Web (Google Account Linking), Gemini Enterprise,
+    # and loopback callbacks.
     allowed_client_redirect_uris: list[str] | None = Field(
         default_factory=lambda: list(DEFAULT_ALLOWED_REDIRECT_URIS)
     )
+    # Pre-registered static OAuth clients (for Gemini Web "Advanced features" / Enterprise).
     static_clients: list[StaticOAuthClientConfig] = Field(default_factory=list)
+    # Scopes advertised to MCP clients (includes Google Account Linking compatibility scope).
     scopes_supported: list[str] = Field(
         default_factory=lambda: list(DEFAULT_SCOPES_SUPPORTED)
     )
@@ -132,10 +145,15 @@ class BackendAuthConfig(BaseModel):
     """How the gateway authenticates against an upstream MCP server."""
 
     type: Literal["none", "bearer", "headers", "oauth"] = "none"
+    # type == "bearer": static token injected as `Authorization: Bearer <token>`.
     token: str | None = None
+    # type == "headers": arbitrary static headers (e.g. X-API-Key).
     headers: dict[str, str] = Field(default_factory=dict)
+    # type == "oauth": scopes to request from the upstream authorization server.
     scopes: list[str] | None = None
+    # type == "oauth": force DCR even if the upstream AS supports CIMD.
     prefer_dcr: bool = False
+    # type == "oauth": pre-registered client credentials.
     client_id: str | None = None
     client_secret: str | None = None
 
@@ -156,6 +174,7 @@ class BackendConfig(BaseModel):
     url: str
     enabled: bool = True
     auth: BackendAuthConfig = Field(default_factory=BackendAuthConfig)
+    # Extra static headers sent with every request regardless of auth type.
     headers: dict[str, str] = Field(default_factory=dict)
 
 
@@ -182,6 +201,7 @@ class GatewayConfig(BaseModel):
 
 
 def _read_encryption_key_file() -> str | None:
+    """Read the key from MCP_GATEWAY_ENCRYPTION_KEY_FILE, if set."""
     key_file = os.environ.get("MCP_GATEWAY_ENCRYPTION_KEY_FILE")
     if not key_file:
         return None
@@ -209,6 +229,7 @@ def load_config(path: str | Path) -> GatewayConfig:
 
 
 def load_storage_path(path: str | Path) -> str:
+    """Read just `storage.path` from a config file."""
     raw = yaml.safe_load(Path(path).read_text())
     if not isinstance(raw, dict):
         raise TypeError(f"Config file {path} must contain a YAML mapping")
