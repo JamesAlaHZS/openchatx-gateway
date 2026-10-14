@@ -4,9 +4,9 @@ set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$DIR"
 
-echo "=================================================="
-echo "    OpenChatX Claude Gateway — Setup Wizard       "
-echo "=================================================="
+echo "========================================================="
+echo "  OpenChatX Claude & Gemini Gateway — Setup Wizard       "
+echo "========================================================="
 echo ""
 
 # 1. Check Python
@@ -60,7 +60,7 @@ ENC_KEY=$(cat "$KEY_FILE")
 # 5. User Credentials
 echo ""
 echo "--- Step 1: Admin Account Setup ---"
-echo "This account is used to log in and approve Claude's OAuth authorization request in your browser."
+echo "This account is used to log in and approve Gemini / Claude OAuth authorization requests in your browser."
 read -p "Username [default: openchatx]: " -r INPUT_USER
 USERNAME="${INPUT_USER:-openchatx}"
 
@@ -71,7 +71,11 @@ PASSWORD="${INPUT_PASS:-openchatx}"
 echo "Generating secure bcrypt password hash..."
 HASH_VAL=$(python3 -c "import bcrypt; print(bcrypt.hashpw('$PASSWORD'.encode(), bcrypt.gensalt(12)).decode())")
 
-# 6. Public Tunnel Domain
+# 6. Static OAuth Client Credentials (for Gemini Advanced features / Enterprise fallback)
+STATIC_CLIENT_ID="openchatx-gemini"
+STATIC_CLIENT_SECRET=$(python3 -c "import secrets; print('ocx_' + secrets.token_urlsafe(24))")
+
+# 7. Public Tunnel Domain
 echo ""
 echo "--- Step 2: Public Ingress Domain ---"
 DETECTED_TS_URL=""
@@ -102,7 +106,7 @@ else
     PUBLIC_URL="${INPUT_URL:-https://your-tunnel-url.example.com}"
 fi
 
-# 7. Write config.yaml
+# 8. Write config.yaml
 echo ""
 echo "Generating config.yaml..."
 cat << EOF > "$DIR/config.yaml"
@@ -120,11 +124,27 @@ auth:
   access_token_expiry_seconds: 3600
   refresh_token_expiry_seconds: 2592000
   login_session_expiry_seconds: 28800
+  scopes_supported:
+    - "mcp"
+    - "offline_access"
+    - "ACCESS_VIEW_MANAGE_MCP_CONTENT"
+  static_clients:
+    - client_id: "$STATIC_CLIENT_ID"
+      client_secret: "$STATIC_CLIENT_SECRET"
+      client_name: "Google Gemini Connected App"
   allowed_client_redirect_uris:
     - "https://claude.ai/api/mcp/auth_callback"
     - "https://claude.com/api/mcp/auth_callback"
+    - "https://oauth-redirect.googleusercontent.com/*"
+    - "https://oauth-redirect-sandbox.googleusercontent.com/*"
+    - "https://oauth-redirect-test.googleusercontent.com/*"
+    - "https://gemini.google.com/*"
+    - "https://vertexaisearch.cloud.google.com/oauth-redirect"
+    - "https://vertexaisearch.cloud.google.com/static/oauth/oauth.html"
     - "http://localhost:*/callback"
+    - "http://localhost:*/*"
     - "http://127.0.0.1:*/callback"
+    - "http://127.0.0.1:*/*"
 
 storage:
   path: $DIR/gateway.db
@@ -138,7 +158,7 @@ EOF
 chmod 600 "$DIR/config.yaml"
 echo "config.yaml written successfully."
 
-# 8. Check OpenChatX App
+# 9. Check OpenChatX App
 echo ""
 echo "--- Step 3: Verifying Local OpenChatX Runtime ---"
 if nc -z 127.0.0.1 8001 >/dev/null 2>&1; then
@@ -160,7 +180,7 @@ else
     fi
 fi
 
-# 9. macOS LaunchAgent Option
+# 10. macOS LaunchAgent Option
 echo ""
 echo "--- Step 4: Background Service ---"
 read -p "Would you like to install the Gateway as a macOS LaunchAgent (auto-starts on boot)? (Y/n): " -r INSTALL_DAEMON
@@ -172,17 +192,22 @@ else
 fi
 
 echo ""
-echo "=================================================="
-echo "           Setup Complete!                        "
-echo "=================================================="
-echo "Next step: Add OpenChatX to your Claude account!"
-echo "1. Go to Claude Settings -> Connectors -> Yours"
-echo "2. Click 'Add connector' -> 'Add custom connector'"
-echo "3. Name: OpenChatX"
-echo "4. MCP server URL: $PUBLIC_URL/mcp"
-echo "5. Select 'Register automatically (DCR)' and click Continue"
-echo "6. In the pop-up, sign in with ($USERNAME / $PASSWORD) and click Approve"
+echo "========================================================="
+echo "                  Setup Complete!                        "
+echo "========================================================="
+echo "MCP Server URL: $PUBLIC_URL/mcp"
+echo "Gateway Login : $USERNAME / $PASSWORD"
 echo ""
-echo "To check system health at any time, run:"
-echo "  bash scripts/status.sh"
-echo "=================================================="
+echo "Static OAuth Credentials (if Gemini asks under 'Advanced features'):"
+echo "  Client ID    : $STATIC_CLIENT_ID"
+echo "  Client Secret: $STATIC_CLIENT_SECRET"
+echo ""
+echo "[How to connect in Gemini Web (gemini.google.com)]:"
+echo "1. Go to https://gemini.google.com -> Settings -> Connected Apps"
+echo "   (or Personal Intelligence -> Connected Apps)"
+echo "2. Under 'Custom apps', click 'Add a custom app'"
+echo "3. Enter MCP server URL: $PUBLIC_URL/mcp"
+echo "   (Optional: if prompted for credentials under 'Advanced features -> Show more',"
+echo "    enter Client ID: $STATIC_CLIENT_ID and Client Secret: $STATIC_CLIENT_SECRET)"
+echo "4. Click Next, sign in with ($USERNAME / $PASSWORD), and click Approve!"
+echo "========================================================="
