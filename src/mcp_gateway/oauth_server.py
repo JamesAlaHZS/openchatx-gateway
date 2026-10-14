@@ -2,7 +2,17 @@
 
 Implements the MCP authorization spec (2025-11-25) for the client leg, with
 full compatibility for Claude, Gemini Web (Custom Connected Apps / Google
-Account Linking), Gemini Enterprise, and local CLI clients.
+Account Linking), Gemini Enterprise, and local CLI clients:
+
+- OAuth 2.1 authorization code flow with mandatory PKCE (S256)
+- Dynamic Client Registration (RFC 7591) at /register
+- Pre-registered Static OAuth Clients (for Gemini Web Advanced features & Enterprise)
+- Client ID Metadata Documents (CIMD) with multi-origin redirect support for
+  Google Account Linking (accountlinking.google.com -> oauth-redirect.googleusercontent.com)
+- Flexible Token Endpoint Client Authentication (accepts client_secret_basic,
+  client_secret_post, private_key_jwt, and none seamlessly)
+- Authorization Server Metadata (RFC 8414) & Protected Resource Metadata (RFC 9728)
+- Short-lived opaque access tokens and rotating refresh tokens, stored hashed
 """
 
 from __future__ import annotations
@@ -52,7 +62,15 @@ CIMD_REFRESH_SECONDS = 3600
 
 
 class GatewayClient(ProxyDCRClient):
-    """Registered client with lenient scope and multi-origin redirect validation."""
+    """Registered client with lenient scope and multi-origin redirect validation.
+
+    - Accepts any requested scopes (including Google Account Linking's
+      ``ACCESS_VIEW_MANAGE_MCP_CONTENT`` and ``offline_access``).
+    - Validates redirect URIs against ``allowed_redirect_uri_patterns`` first
+      (allowing Google's ``oauth-redirect*.googleusercontent.com`` callbacks
+      even when the client was registered via CIMD on ``accountlinking.google.com``
+      or via static config).
+    """
 
     def validate_scope(self, requested_scope: str | None) -> list[str] | None:
         if requested_scope is None:
@@ -73,7 +91,16 @@ class GatewayClient(ProxyDCRClient):
 
 class FlexibleClientAuthenticator(PrivateKeyJWTClientAuthenticator):
     """Client authenticator that seamlessly handles client_secret_basic,
-    client_secret_post, private_key_jwt, and public (none) PKCE exchanges."""
+    client_secret_post, private_key_jwt, and public (none) PKCE exchanges.
+
+    Google's OAuth relay (Gemini Web / Gemini Enterprise) may register a client
+    with ``client_secret_post`` (or omit ``token_endpoint_auth_method``, which
+    defaults to ``client_secret_basic`` or ``client_secret_post``) and then
+    present credentials via HTTP Basic Auth header OR POST form body, or rely
+    purely on PKCE without sending the secret. Standard SDK validation rejects
+    mismatched transport methods with 401/400; this authenticator accepts any
+    valid credential presentation for the registered client.
+    """
 
     async def authenticate_request(self, request: Request) -> OAuthClientInformationFull:
         form_data = await request.form()
@@ -109,7 +136,8 @@ class FlexibleClientAuthenticator(PrivateKeyJWTClientAuthenticator):
         if isinstance(form_secret, str) and form_secret and provided_secret is None:
             provided_secret = form_secret
 
-        # 3. Fallback: infer client_id from stored code or refresh_token if omitted
+        # 3. Fallback: if Gemini's token exchange omitted client_id on authorization_code
+        # or refresh_token grant, infer client_id from the stored code/refresh_token
         if not client_id and hasattr(self, "provider"):
             provider = getattr(self, "provider", None)
             if provider is not None and hasattr(provider, "storage"):
@@ -133,6 +161,10 @@ class FlexibleClientAuthenticator(PrivateKeyJWTClientAuthenticator):
         if client is None:
             raise AuthenticationError(f"Invalid or unregistered client_id: {client_id}")
 
+        # 4. If the client has a configured client_secret and the caller provided one,
+        # verify it in constant time. If the caller omitted client_secret (e.g. public
+        # PKCE client behaviour), allow PKCE code_verifier validation in TokenHandler
+        # to authenticate the code exchange.
         if client.client_secret and provided_secret is not None:
             if not hmac.compare_digest(
                 client.client_secret.encode("utf-8"),
@@ -153,7 +185,7 @@ class GatewayOAuthProvider(OAuthProvider):
             issuer_url=public_url,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True,
-                valid_scopes=None,
+                valid_scopes=None,  # accept any; scopes are informational here
                 default_scopes=list(config.auth.scopes_supported),
             ),
             revocation_options=RevocationOptions(enabled=True),
@@ -161,6 +193,8 @@ class GatewayOAuthProvider(OAuthProvider):
         )
         self.config = config
         self.storage = storage
+        # Always merge user-configured redirect URIs with the built-in defaults
+        # so existing config.yaml files created for Claude also allow Gemini Web.
         configured_uris = config.auth.allowed_client_redirect_uris
         if configured_uris is not None:
             merged: list[str] = list(configured_uris)
@@ -214,6 +248,8 @@ class GatewayOAuthProvider(OAuthProvider):
 
     def _client_from_record(self, record: dict[str, Any]) -> GatewayClient:
         client = GatewayClient.model_validate(record)
+        # Always apply the current allowlist patterns so updating config.yaml
+        # immediately takes effect for existing cached clients in gateway.db.
         client.allowed_redirect_uri_patterns = self._allowed_redirect_patterns
         return client
 
@@ -241,6 +277,9 @@ class GatewayOAuthProvider(OAuthProvider):
             cimd_client = await self._fetch_cimd_client(client_id)
             if cimd_client is not None:
                 return cimd_client
+            # Fallback for Google Account Linking CIMD URLs (e.g.
+            # https://accountlinking.google.com/clientidmetadata/...) if the
+            # metadata document cannot be fetched or fails strict same-origin checks:
             parsed = urlparse(client_id)
             if parsed.scheme == "https" and (
                 parsed.hostname == "accountlinking.google.com"
@@ -321,6 +360,7 @@ class GatewayOAuthProvider(OAuthProvider):
         return f"{str(self.base_url).rstrip('/')}/ui/authorize?txn={txn_id}"
 
     def describe_txn(self, txn_id: str) -> dict[str, Any] | None:
+        """Public transaction info for the login/consent UI."""
         txn = self.storage.get_txn(txn_id)
         if txn is None:
             return None
@@ -338,6 +378,7 @@ class GatewayOAuthProvider(OAuthProvider):
         }
 
     def complete_authorization(self, txn_id: str, *, subject: str, approve: bool) -> str:
+        """Finish a parked authorization request; returns the redirect URL."""
         txn = self.storage.get_txn(txn_id)
         if txn is None:
             raise AuthorizeError(
@@ -505,6 +546,7 @@ class GatewayOAuthProvider(OAuthProvider):
     # ------------------------------------------------------------------ routes
 
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
+        """Standard OAuth routes with CIMD and FlexibleClientAuthenticator patched in."""
         routes = super().get_routes(mcp_path)
         token_endpoint_url = f"{str(self.base_url).rstrip('/')}/token"
         patched: list[Route] = []
