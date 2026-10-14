@@ -1,29 +1,19 @@
 """Client-facing OAuth 2.1 authorization server for the gateway.
 
-Implements the MCP authorization spec (2025-11-25) for the client leg:
-
-- OAuth 2.1 authorization code flow with mandatory PKCE (S256)
-- Dynamic Client Registration (RFC 7591) at /register
-- Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document)
-  for URL-based client IDs, including private_key_jwt client authentication
-- Authorization Server Metadata (RFC 8414) with
-  ``client_id_metadata_document_supported: true``
-- Protected Resource Metadata (RFC 9728) and 401 challenges with
-  ``WWW-Authenticate: Bearer resource_metadata="..."``
-- Short-lived opaque access tokens and rotating refresh tokens, stored hashed
-
-The interactive part (login + consent) is delegated to a small web UI: the
-``authorize`` hook parks the request in a transaction and redirects the
-browser to ``/ui/authorize?txn=...``; the UI drives login/consent through the
-JSON API in ``web.py`` and finally calls :meth:`GatewayOAuthProvider.complete_authorization`.
+Implements the MCP authorization spec (2025-11-25) for the client leg, with
+full compatibility for Claude, Gemini Web (Custom Connected Apps / Google
+Account Linking), Gemini Enterprise, and local CLI clients.
 """
 
 from __future__ import annotations
 
+import base64
+import hmac
 import logging
 import secrets
 import time
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from fastmcp.server.auth.auth import (
     AccessToken as FastMCPAccessToken,
@@ -35,7 +25,9 @@ from fastmcp.server.auth.auth import (
 )
 from fastmcp.server.auth.cimd import CIMDClientManager
 from fastmcp.server.auth.oauth_proxy.models import ProxyDCRClient
+from fastmcp.server.auth.redirect_validation import validate_redirect_uri
 from mcp.server.auth.handlers.metadata import MetadataHandler
+from mcp.server.auth.middleware.client_auth import AuthenticationError
 from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
@@ -48,9 +40,10 @@ from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyUrl
+from starlette.requests import Request
 from starlette.routing import Route
 
-from mcp_gateway.config import GatewayConfig
+from mcp_gateway.config import DEFAULT_ALLOWED_REDIRECT_URIS, GatewayConfig
 from mcp_gateway.storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -59,25 +52,99 @@ CIMD_REFRESH_SECONDS = 3600
 
 
 class GatewayClient(ProxyDCRClient):
-    """Registered client with lenient scope validation.
-
-    MCP clients frequently request scopes taken from the 401 challenge or the
-    protected resource metadata rather than from their own registration
-    record. The gateway is a single-identity authorization server, so scopes
-    do not gate anything security-relevant; accept whatever is requested
-    instead of failing the flow with ``invalid_scope``.
-    """
+    """Registered client with lenient scope and multi-origin redirect validation."""
 
     def validate_scope(self, requested_scope: str | None) -> list[str] | None:
         if requested_scope is None:
             if self.scope:
                 return self.scope.split(" ")
             return None
-        return requested_scope.split(" ")
+        return [s for s in requested_scope.split(" ") if s]
+
+    def validate_redirect_uri(self, redirect_uri: AnyUrl | None) -> AnyUrl:
+        if redirect_uri is not None and self.allowed_redirect_uri_patterns:
+            if validate_redirect_uri(
+                redirect_uri=redirect_uri,
+                allowed_patterns=self.allowed_redirect_uri_patterns,
+            ):
+                return redirect_uri
+        return super().validate_redirect_uri(redirect_uri)
+
+
+class FlexibleClientAuthenticator(PrivateKeyJWTClientAuthenticator):
+    """Client authenticator that seamlessly handles client_secret_basic,
+    client_secret_post, private_key_jwt, and public (none) PKCE exchanges."""
+
+    async def authenticate_request(self, request: Request) -> OAuthClientInformationFull:
+        form_data = await request.form()
+        grant_type = str(form_data.get("grant_type", ""))
+
+        # 1. If client_assertion is present (CIMD private_key_jwt), delegate to parent
+        if "client_assertion" in form_data:
+            return await super().authenticate_request(request)
+
+        # 2. Extract client_id and optional client_secret from Basic header or form body
+        client_id: str | None = None
+        provided_secret: str | None = None
+
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.lower().startswith("basic "):
+            try:
+                decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8")
+                if ":" in decoded:
+                    raw_id, raw_secret = decoded.split(":", 1)
+                    client_id = unquote(raw_id)
+                    provided_secret = unquote(raw_secret)
+            except Exception as exc:
+                raise AuthenticationError("Invalid Basic Authorization header") from exc
+
+        form_client_id = form_data.get("client_id")
+        if isinstance(form_client_id, str) and form_client_id:
+            if client_id is None:
+                client_id = form_client_id
+            elif client_id != form_client_id:
+                raise AuthenticationError("Mismatched client_id in header and body")
+
+        form_secret = form_data.get("client_secret")
+        if isinstance(form_secret, str) and form_secret and provided_secret is None:
+            provided_secret = form_secret
+
+        # 3. Fallback: infer client_id from stored code or refresh_token if omitted
+        if not client_id and hasattr(self, "provider"):
+            provider = getattr(self, "provider", None)
+            if provider is not None and hasattr(provider, "storage"):
+                if grant_type == "authorization_code":
+                    code_val = form_data.get("code")
+                    if isinstance(code_val, str) and code_val:
+                        code_data = provider.storage.get_auth_code(code_val)
+                        if code_data:
+                            client_id = code_data.get("client_id")
+                elif grant_type == "refresh_token":
+                    rt_val = form_data.get("refresh_token")
+                    if isinstance(rt_val, str) and rt_val:
+                        rt_data = provider.storage.get_refresh_token(rt_val)
+                        if rt_data:
+                            client_id = rt_data.get("client_id")
+
+        if not client_id:
+            raise AuthenticationError("Missing client_id in token request")
+
+        client = await self.provider.get_client(client_id)
+        if client is None:
+            raise AuthenticationError(f"Invalid or unregistered client_id: {client_id}")
+
+        if client.client_secret and provided_secret is not None:
+            if not hmac.compare_digest(
+                client.client_secret.encode("utf-8"),
+                provided_secret.encode("utf-8"),
+            ):
+                raise AuthenticationError("Invalid client_secret")
+
+        return client
 
 
 class GatewayOAuthProvider(OAuthProvider):
-    """A minimal, self-contained OAuth AS backed by SQLite and config-file users."""
+    """A self-contained OAuth 2.1 AS backed by SQLite and config-file users."""
 
     def __init__(self, config: GatewayConfig, storage: Storage):
         public_url = config.server.public_url
@@ -86,7 +153,7 @@ class GatewayOAuthProvider(OAuthProvider):
             issuer_url=public_url,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True,
-                valid_scopes=None,  # accept any; scopes are informational here
+                valid_scopes=None,
                 default_scopes=list(config.auth.scopes_supported),
             ),
             revocation_options=RevocationOptions(enabled=True),
@@ -94,23 +161,69 @@ class GatewayOAuthProvider(OAuthProvider):
         )
         self.config = config
         self.storage = storage
-        self._allowed_redirect_patterns = config.auth.allowed_client_redirect_uris
+        configured_uris = config.auth.allowed_client_redirect_uris
+        if configured_uris is not None:
+            merged: list[str] = list(configured_uris)
+            for default_uri in DEFAULT_ALLOWED_REDIRECT_URIS:
+                if default_uri not in merged:
+                    merged.append(default_uri)
+            self._allowed_redirect_patterns: list[str] | None = merged
+        else:
+            self._allowed_redirect_patterns = None
+
         self.cimd_manager = CIMDClientManager(
             enable_cimd=True,
             default_scope=" ".join(config.auth.scopes_supported),
             allowed_redirect_uri_patterns=self._allowed_redirect_patterns,
         )
+        self._static_clients: dict[str, GatewayClient] = {}
+        self._init_static_clients()
+
+    def _init_static_clients(self) -> None:
+        """Register static OAuth clients from config.yaml into memory and storage."""
+        default_redirects = [
+            AnyUrl("https://oauth-redirect.googleusercontent.com/r/openchatx"),
+            AnyUrl("https://vertexaisearch.cloud.google.com/oauth-redirect"),
+            AnyUrl("https://claude.ai/api/mcp/auth_callback"),
+            AnyUrl("http://localhost:8080/callback"),
+        ]
+        for sc in self.config.auth.static_clients:
+            redirect_uris = (
+                [AnyUrl(u) for u in sc.redirect_uris]
+                if sc.redirect_uris
+                else default_redirects
+            )
+            auth_method = "client_secret_post" if sc.client_secret else "none"
+            client = GatewayClient(
+                client_id=sc.client_id,
+                client_secret=sc.client_secret,
+                client_name=sc.client_name,
+                redirect_uris=redirect_uris,
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+                token_endpoint_auth_method=auth_method,
+                scope=" ".join(self.config.auth.scopes_supported),
+                allowed_redirect_uri_patterns=self._allowed_redirect_patterns,
+            )
+            self._static_clients[sc.client_id] = client
+            self.storage.save_client(sc.client_id, client.model_dump(mode="json"))
+            self.storage.mark_client_used(sc.client_id)
+            logger.info("Loaded static OAuth client %r (client_id=%s)", sc.client_name, sc.client_id)
 
     # ------------------------------------------------------------------ clients
 
     def _client_from_record(self, record: dict[str, Any]) -> GatewayClient:
-        return GatewayClient.model_validate(record)
+        client = GatewayClient.model_validate(record)
+        client.allowed_redirect_uri_patterns = self._allowed_redirect_patterns
+        return client
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        if client_id in self._static_clients:
+            return self._static_clients[client_id]
+
         record = self.storage.get_client(client_id)
         if record is not None:
             client = self._client_from_record(record)
-            # Refresh CIMD-backed clients periodically via the cache-aware fetcher.
             if client.cimd_document is not None and (
                 client.cimd_fetched_at is None
                 or time.time() - client.cimd_fetched_at > CIMD_REFRESH_SECONDS
@@ -125,16 +238,50 @@ class GatewayOAuthProvider(OAuthProvider):
 
         if self.cimd_manager.is_cimd_client_id(client_id):
             logger.debug("Client %s not found in storage; fetching from CIMD", client_id)
-            return await self._fetch_cimd_client(client_id)
-        
-        logger.debug("Client %s is not a CIMD client, return None", client_id)
+            cimd_client = await self._fetch_cimd_client(client_id)
+            if cimd_client is not None:
+                return cimd_client
+            parsed = urlparse(client_id)
+            if parsed.scheme == "https" and (
+                parsed.hostname == "accountlinking.google.com"
+                or (parsed.hostname or "").endswith(".google.com")
+                or (parsed.hostname or "").endswith(".googleusercontent.com")
+            ):
+                logger.info(
+                    "Synthesizing fallback CIMD client for Google Account Linking (%s)",
+                    client_id,
+                )
+                fallback = GatewayClient(
+                    client_id=client_id,
+                    client_secret=None,
+                    client_name="Google Gemini Connected App",
+                    redirect_uris=[
+                        AnyUrl("https://oauth-redirect.googleusercontent.com/r/gemini")
+                    ],
+                    grant_types=["authorization_code", "refresh_token"],
+                    response_types=["code"],
+                    token_endpoint_auth_method="none",
+                    scope=" ".join(self.config.auth.scopes_supported),
+                    allowed_redirect_uri_patterns=self._allowed_redirect_patterns,
+                )
+                self.storage.save_client(
+                    client_id, fallback.model_dump(mode="json"), is_cimd=True
+                )
+                return fallback
+
+        logger.debug("Client %s is not a known or CIMD client, return None", client_id)
         return None
 
     async def _fetch_cimd_client(self, client_id: str) -> GatewayClient | None:
-        cimd_client = await self.cimd_manager.get_client(client_id)
+        try:
+            cimd_client = await self.cimd_manager.get_client(client_id)
+        except Exception as exc:
+            logger.warning("Failed to fetch CIMD document for %s: %s", client_id, exc)
+            return None
         if cimd_client is None:
             return None
         client = GatewayClient.model_validate(cimd_client.model_dump(mode="json"))
+        client.allowed_redirect_uri_patterns = self._allowed_redirect_patterns
         self.storage.save_client(client_id, client.model_dump(mode="json"), is_cimd=True)
         return client
 
@@ -143,9 +290,10 @@ class GatewayOAuthProvider(OAuthProvider):
         client.allowed_redirect_uri_patterns = self._allowed_redirect_patterns
         self.storage.save_client(client.client_id, client.model_dump(mode="json"))
         logger.info(
-            "Registered new OAuth client %r via DCR (%s)",
+            "Registered new OAuth client %r via DCR (%s, redirect_uris=%s)",
             client_info.client_name or client_info.client_id,
             client.client_id,
+            [str(u) for u in (client.redirect_uris or [])],
         )
 
     # ------------------------------------------------------------------ authorize
@@ -173,11 +321,9 @@ class GatewayOAuthProvider(OAuthProvider):
         return f"{str(self.base_url).rstrip('/')}/ui/authorize?txn={txn_id}"
 
     def describe_txn(self, txn_id: str) -> dict[str, Any] | None:
-        """Public transaction info for the login/consent UI."""
         txn = self.storage.get_txn(txn_id)
         if txn is None:
             return None
-        from urllib.parse import urlparse
 
         redirect = urlparse(txn["redirect_uri"])
         return {
@@ -192,11 +338,6 @@ class GatewayOAuthProvider(OAuthProvider):
         }
 
     def complete_authorization(self, txn_id: str, *, subject: str, approve: bool) -> str:
-        """Finish a parked authorization request; returns the redirect URL.
-
-        Called by the consent endpoint after the user authenticated and made a
-        decision. Generates the authorization code on approval.
-        """
         txn = self.storage.get_txn(txn_id)
         if txn is None:
             raise AuthorizeError(
@@ -229,7 +370,9 @@ class GatewayOAuthProvider(OAuthProvider):
             },
             expires_at=expires_at,
         )
-        return construct_redirect_uri(txn["redirect_uri"], code=code, state=txn.get("state"))
+        return construct_redirect_uri(
+            txn["redirect_uri"], code=code, state=txn.get("state")
+        )
 
     # ------------------------------------------------------------------ codes & tokens
 
@@ -263,10 +406,11 @@ class GatewayOAuthProvider(OAuthProvider):
         refresh_token = secrets.token_urlsafe(43)
         now = time.time()
         access_expiry = self.config.auth.access_token_expiry_seconds
+        effective_scopes = scopes if scopes else list(self.config.auth.scopes_supported)
         self.storage.save_access_token(
             access_token,
             client_id=client_id,
-            scopes=scopes,
+            scopes=effective_scopes,
             subject=subject,
             resource=resource,
             expires_at=now + access_expiry,
@@ -274,7 +418,7 @@ class GatewayOAuthProvider(OAuthProvider):
         self.storage.save_refresh_token(
             refresh_token,
             client_id=client_id,
-            scopes=scopes,
+            scopes=effective_scopes,
             subject=subject,
             resource=resource,
             expires_at=now + self.config.auth.refresh_token_expiry_seconds,
@@ -283,19 +427,16 @@ class GatewayOAuthProvider(OAuthProvider):
             access_token=access_token,
             token_type="Bearer",
             expires_in=access_expiry,
-            scope=" ".join(scopes) if scopes else None,
+            scope=" ".join(effective_scopes) if effective_scopes else "mcp",
             refresh_token=refresh_token,
         )
 
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        # Single-use: consume the code before issuing anything.
         if self.storage.get_auth_code(authorization_code.code) is None:
             raise TokenError(error="invalid_grant", error_description="Authorization code expired")
         self.storage.delete_auth_code(authorization_code.code)
-        # A completed authorization exempts this client from the unused-client
-        # TTL that reclaims anonymous DCR/CIMD registrations (see storage.py).
         self.storage.mark_client_used(client.client_id)
         logger.info(
             "Issuing access/refresh token pair to client %s (subject=%s)",
@@ -332,8 +473,6 @@ class GatewayOAuthProvider(OAuthProvider):
         data = self.storage.get_refresh_token(refresh_token.token)
         if data is None or data["client_id"] != client.client_id:
             raise TokenError(error="invalid_grant", error_description="Invalid refresh token")
-        # Rotation (OAuth 2.1 requirement for public clients): the old refresh
-        # token is revoked and a fresh access/refresh pair is issued.
         self.storage.revoke_refresh_token(refresh_token.token)
         effective_scopes = scopes or data["scopes"]
         logger.debug("Rotating refresh token for client %s", client.client_id)
@@ -366,13 +505,6 @@ class GatewayOAuthProvider(OAuthProvider):
     # ------------------------------------------------------------------ routes
 
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
-        """Standard OAuth routes with CIMD support patched in.
-
-        - AS metadata advertises ``client_id_metadata_document_supported`` and
-          the ``private_key_jwt``/``none`` token endpoint auth methods.
-        - The token endpoint accepts ``private_key_jwt`` client assertions from
-          CIMD clients (validated against the JWKS in their metadata document).
-        """
         routes = super().get_routes(mcp_path)
         token_endpoint_url = f"{str(self.base_url).rstrip('/')}/token"
         patched: list[Route] = []
@@ -383,7 +515,7 @@ class GatewayOAuthProvider(OAuthProvider):
                 and route.methods is not None
                 and "POST" in route.methods
             ):
-                authenticator = PrivateKeyJWTClientAuthenticator(
+                authenticator = FlexibleClientAuthenticator(
                     provider=self,
                     cimd_manager=self.cimd_manager,
                     token_endpoint_url=token_endpoint_url,
@@ -409,7 +541,16 @@ class GatewayOAuthProvider(OAuthProvider):
                 existing = metadata.token_endpoint_auth_methods_supported or []
                 methods = [
                     *existing,
-                    *(m for m in ("private_key_jwt", "none") if m not in existing),
+                    *(
+                        m
+                        for m in (
+                            "client_secret_basic",
+                            "client_secret_post",
+                            "private_key_jwt",
+                            "none",
+                        )
+                        if m not in existing
+                    ),
                 ]
                 metadata.token_endpoint_auth_methods_supported = methods
                 if self.config.auth.scopes_supported:
@@ -424,8 +565,6 @@ class GatewayOAuthProvider(OAuthProvider):
                         include_in_schema=route.include_in_schema,
                     )
                 )
-                # OIDC Discovery alias (RFC 8414 §5): some clients probe
-                # /.well-known/openid-configuration instead of the OAuth path.
                 patched.append(
                     Route(
                         path="/.well-known/openid-configuration",
