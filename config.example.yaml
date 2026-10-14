@@ -1,34 +1,47 @@
+# OpenChatX Claude & Gemini Gateway Configuration
+# Values support environment variable expansion: ${VAR} or ${VAR:-default}
+
 server:
-  # 填入你的 Tailscale Funnel 或 Cloudflare Tunnel 公网 HTTPS 地址（不带 /mcp）
-  public_url: https://your-machine-name.your-tailnet.ts.net
+  # Public HTTPS URL of the gateway as reached by Google Gemini / Anthropic Claude servers.
+  # Example with Tailscale Funnel: https://your-machine-name.your-tailnet.ts.net
+  # Example with Cloudflare Tunnel: https://your-subdomain.trycloudflare.com
+  public_url: https://your-tunnel-url.example.com
   host: 127.0.0.1
   port: 8765
   trusted_proxy_ips: 127.0.0.1
 
 auth:
-  encryption_key: ${MCP_GATEWAY_ENCRYPTION_KEY:-你的加密密钥}
+  # Encryption key used to protect registered OAuth client credentials and tokens.
+  # Generated automatically by scripts/setup.sh, or set via MCP_GATEWAY_ENCRYPTION_KEY.
+  encryption_key: ${MCP_GATEWAY_ENCRYPTION_KEY:-}
 
+  # Local users allowed to approve OAuth authorization requests.
+  # Generate a bcrypt password hash using: python3 scripts/hash_password.py
   users:
     - username: openchatx
       password_hash: "$2b$12$5BqOSm8a9DHyejlFZW9Pv.iBFvF.GEUVw6wtjCtuYRusmT.mLNH7e"
+      # Default credentials generated above:
+      # Username: openchatx
+      # Password: openchatx
 
+  # Lifetimes (seconds)
   access_token_expiry_seconds: 3600
-  refresh_token_expiry_seconds: 2592000
-  login_session_expiry_seconds: 28800
+  refresh_token_expiry_seconds: 2592000   # 30 days
+  login_session_expiry_seconds: 28800     # 8 hours
 
-  # 新增：支持 Google Account Linking 兼容性 Scope
+  # Scopes advertised to MCP clients (includes Google Account Linking compatibility scope)
   scopes_supported:
     - "mcp"
     - "offline_access"
     - "ACCESS_VIEW_MANAGE_MCP_CONTENT"
 
-  # 新增：预置静态 OAuth Client（当 Gemini 网页版要求手动填写 Client ID / Secret 时使用）
+  # Pre-registered static OAuth clients (for Gemini Web "Advanced features" or Gemini Enterprise)
   static_clients:
     - client_id: "openchatx-gemini"
       client_secret: "openchatx-gemini-secret"
       client_name: "Google Gemini Connected App"
 
-  # 新增：放行 Gemini 网页版、Gemini Enterprise、Claude 及本地回调地址
+  # Allowed OAuth redirect URIs (Claude Web/App, Gemini Web/Spark, Gemini Enterprise, and Loopback)
   allowed_client_redirect_uris:
     - "https://claude.ai/api/mcp/auth_callback"
     - "https://claude.com/api/mcp/auth_callback"
@@ -47,6 +60,8 @@ storage:
   path: ./gateway.db
 
 backends:
+  # Local OpenChatX Core Runtime
+  # OpenChatX desktop app serves its MCP endpoint on port 8001 by default.
   openchatx:
     url: http://127.0.0.1:8001/mcp
     auth:
